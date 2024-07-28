@@ -9,41 +9,50 @@ import (
 	"net/http"
 	"os"
 
+	"crypto/tls"
+
 	"github.com/machinebox/graphql"
 )
 
 var query = `
-	query($userName:String!, $id:ID) { 
-	  user(login: $userName){
-	    repositoriesContributedTo(includeUserRepositories: true, contributionTypes: COMMIT, first: 100) {
-	      pageInfo {
-	        hasNextPage
-	        endCursor
-	      }
-	      nodes {
-	        defaultBranchRef {
-	          target {
-	            ... on Commit {
-	              history(author: {id: $id}) {
-	                pageInfo {
-	                  hasNextPage
-	                  endCursor
-	                }
-	                nodes {
-	                  commitUrl
-	                  author {
-	                    email
-	                    name
-	                  }
-	                }
-	              }
-	            }
-	          }
-	        }
-	      }
-	    }
-	  }
-	}`
+
+query ($userName: String!, $id: ID) {
+  user(login: $userName) {
+    repositoriesContributedTo(
+      includeUserRepositories: true
+      contributionTypes: COMMIT
+      first: 100
+    ) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        refs(first: 100, refPrefix: "refs/") {
+          nodes {
+            target {
+              ... on Commit {
+                history(author: { id: $id }) {
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
+                  nodes {
+                    author {
+                      email
+                      name
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+`
 
 func main() {
 	username := flag.String("user", "", "(REQUIRED) Username of the target github account")
@@ -71,7 +80,8 @@ func main() {
 		os.Exit(0)
 	}
 
-	userreq, err := http.NewRequest("GET", fmt.Sprintf("https://api.github.com/users/%s", *username), nil)
+	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	userreq, err := http.NewRequest("GET", fmt.Sprintf("http://api.github.com/users/%s", *username), nil)
 	if err != nil {
 		panic(err)
 	}
@@ -119,18 +129,20 @@ func main() {
 					EndCursor   string
 				}
 				Nodes []struct {
-					DefaultBranchRef struct {
-						Target struct {
-							History struct {
-								PageInfo struct {
-									HasNextPage bool
-									EndCursor   string
-								}
-								Nodes []struct {
-									CommitURL string
-									Author    struct {
-										Email string
-										Name  string
+					Refs struct { //
+						Nodes []struct {
+							Target struct {
+								History struct {
+									PageInfo struct {
+										HasNextPage bool
+										EndCursor   string
+									}
+									Nodes []struct {
+										CommitURL string
+										Author    struct {
+											Email string
+											Name  string
+										}
 									}
 								}
 							}
@@ -140,7 +152,6 @@ func main() {
 			}
 		}
 	}
-
 	err = client.Run(context.Background(), req, &respData)
 	if err != nil {
 		log.Fatalf("Failed to execute request: %v", err)
@@ -149,16 +160,19 @@ func main() {
 	unique := make(map[string]bool)
 
 	for _, repo := range respData.User.RepositoriesContributedTo.Nodes {
-		for _, commit := range repo.DefaultBranchRef.Target.History.Nodes {
-			identity := fmt.Sprintf("%s <%s>", commit.Author.Name, commit.Author.Email)
-			if _, exists := unique[identity]; *showall || !exists {
-				unique[identity] = true
-				if *printsource {
-					fmt.Printf("%s - %s\n", identity, commit.CommitURL)
-				} else {
-					fmt.Println(identity)
+		for _, ref := range repo.Refs.Nodes {
+			for _, commit := range ref.Target.History.Nodes {
+				identity := fmt.Sprintf("%s <%s>", commit.Author.Name, commit.Author.Email)
+				if _, exists := unique[identity]; *showall || !exists {
+					unique[identity] = true
+					if *printsource {
+						fmt.Printf("%s - %s\n", identity, commit.CommitURL)
+					} else {
+						fmt.Println(identity)
+					}
 				}
 			}
 		}
+
 	}
 }
