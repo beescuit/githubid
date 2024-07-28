@@ -6,6 +6,10 @@ Under the hood, this uses Github's GraphQL API to query for the commits a user h
 
 ![Screenshot highlighting basic usage of this tool](./img/screenshot.png)
 
+## Installation
+
+You can either download precompiled binaries from the [releases page](https://github.com/beescuit/githubid/releases/tag/v1.0.0) or run `go install github.com/beescuit/githubid@latest`.
+
 ## Usage
 
 You'll need a Github Token to use this tool. You can generate a Personal Access Token [here](https://github.com/settings/tokens).
