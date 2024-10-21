@@ -8,53 +8,13 @@ import (
 	"log"
 	"net/http"
 	"os"
-
-	"crypto/tls"
+	"time"
 
 	"github.com/machinebox/graphql"
 )
 
-var query = `
-
-query ($userName: String!, $id: ID) {
-  user(login: $userName) {
-    repositoriesContributedTo(
-      includeUserRepositories: true
-      contributionTypes: COMMIT
-      first: 100
-    ) {
-      pageInfo {
-        hasNextPage
-        endCursor
-      }
-      nodes {
-        refs(first: 100, refPrefix: "refs/") {
-          nodes {
-            target {
-              ... on Commit {
-                history(author: { id: $id }) {
-                  pageInfo {
-                    hasNextPage
-                    endCursor
-                  }
-                  nodes {
-                    author {
-                      email
-                      name
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-`
-
 func main() {
+
 	username := flag.String("user", "", "(REQUIRED) Username of the target github account")
 	printsource := flag.Bool("source", false, "Print commit URLs alongside discovered identities")
 	showall := flag.Bool("all", false, "Print all commits (will repeat duplicate identities)")
@@ -67,7 +27,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	var token = ""
+	var token string
 
 	if *flagtoken == "" {
 		token = os.Getenv("GH_TOKEN")
@@ -80,8 +40,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	userreq, err := http.NewRequest("GET", fmt.Sprintf("http://api.github.com/users/%s", *username), nil)
+	userreq, err := http.NewRequest("GET", fmt.Sprintf("https://api.github.com/users/%s", *username), nil)
 	if err != nil {
 		panic(err)
 	}
@@ -114,65 +73,211 @@ func main() {
 
 	client := graphql.NewClient("https://api.github.com/graphql")
 
-	req := graphql.NewRequest(query)
+	unique := make(map[string]bool)
 
-	req.Var("userName", username)
-	req.Var("id", userid)
+	var repoCursor *string = nil
+	for {
+		var repoQuery = `
+        query ($userName: String!, $repoCursor: String) {
+          user(login: $userName) {
+            repositoriesContributedTo(
+              includeUserRepositories: true
+              contributionTypes: [COMMIT]
+              first: 50
+              after: $repoCursor
+            ) {
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+              nodes {
+                name
+                owner {
+                    login
+                }
+              }
+            }
+          }
+        }`
 
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+		req := graphql.NewRequest(repoQuery)
+		req.Var("userName", *username)
+		if repoCursor != nil {
+			req.Var("repoCursor", *repoCursor)
+		}
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 
-	var respData struct {
-		User struct {
-			RepositoriesContributedTo struct {
-				PageInfo struct {
-					HasNextPage bool
-					EndCursor   string
-				}
-				Nodes []struct {
-					Refs struct { //
-						Nodes []struct {
-							Target struct {
-								History struct {
-									PageInfo struct {
-										HasNextPage bool
-										EndCursor   string
-									}
-									Nodes []struct {
-										CommitURL string
-										Author    struct {
-											Email string
-											Name  string
-										}
-									}
-								}
-							}
+		var repoResp struct {
+			User struct {
+				RepositoriesContributedTo struct {
+					PageInfo struct {
+						HasNextPage bool
+						EndCursor   string
+					}
+					Nodes []struct {
+						Name  string
+						Owner struct {
+							Login string
 						}
 					}
 				}
 			}
 		}
-	}
-	err = client.Run(context.Background(), req, &respData)
-	if err != nil {
-		log.Fatalf("Failed to execute request: %v", err)
-	}
 
-	unique := make(map[string]bool)
+		err = client.Run(context.Background(), req, &repoResp)
+		if err != nil {
+			log.Fatalf("Failed to execute request: %v", err)
+		}
 
-	for _, repo := range respData.User.RepositoriesContributedTo.Nodes {
-		for _, ref := range repo.Refs.Nodes {
-			for _, commit := range ref.Target.History.Nodes {
-				identity := fmt.Sprintf("%s <%s>", commit.Author.Name, commit.Author.Email)
-				if _, exists := unique[identity]; *showall || !exists {
-					unique[identity] = true
-					if *printsource {
-						fmt.Printf("%s - %s\n", identity, commit.CommitURL)
-					} else {
-						fmt.Println(identity)
+		for _, repo := range repoResp.User.RepositoriesContributedTo.Nodes {
+			repoName := repo.Name
+			ownerLogin := repo.Owner.Login
+
+			var refCursor *string = nil
+			for {
+				var refQuery = `
+                query ($owner: String!, $name: String!, $refCursor: String) {
+                  repository(owner: $owner, name: $name) {
+                    refs(first: 10, refPrefix: "refs/heads/", after: $refCursor) {
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                      nodes {
+                        name
+                      }
+                    }
+                  }
+                }`
+				req := graphql.NewRequest(refQuery)
+				req.Var("owner", ownerLogin)
+				req.Var("name", repoName)
+				if refCursor != nil {
+					req.Var("refCursor", *refCursor)
+				}
+				req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+
+				var refResp struct {
+					Repository struct {
+						Refs struct {
+							PageInfo struct {
+								HasNextPage bool
+								EndCursor   string
+							}
+							Nodes []struct {
+								Name string
+							}
+						}
 					}
 				}
+
+				err = client.Run(context.Background(), req, &refResp)
+				if err != nil {
+					log.Fatalf("Failed to execute request: %v", err)
+				}
+
+				for _, ref := range refResp.Repository.Refs.Nodes {
+					refName := ref.Name
+
+					var commitCursor *string = nil
+					for {
+						var commitQuery = `
+                        query ($owner: String!, $name: String!, $refName: String!, $authorId: ID!, $commitCursor: String) {
+                          repository(owner: $owner, name: $name) {
+                            ref(qualifiedName: $refName) {
+                              target {
+                                ... on Commit {
+                                  history(author: {id: $authorId}, first: 50, after: $commitCursor) {
+                                    pageInfo {
+                                      hasNextPage
+                                      endCursor
+                                    }
+                                    nodes {
+                                      commitUrl
+                                      author {
+                                        name
+                                        email
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }`
+						req := graphql.NewRequest(commitQuery)
+						req.Var("owner", ownerLogin)
+						req.Var("name", repoName)
+						req.Var("refName", refName)
+						req.Var("authorId", userid)
+						if commitCursor != nil {
+							req.Var("commitCursor", *commitCursor)
+						}
+						req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+
+						var commitResp struct {
+							Repository struct {
+								Ref struct {
+									Target struct {
+										History struct {
+											PageInfo struct {
+												HasNextPage bool
+												EndCursor   string
+											}
+											Nodes []struct {
+												CommitURL string `json:"commitUrl"`
+												Author    struct {
+													Name  string
+													Email string
+												}
+											}
+										}
+									} `json:"target"`
+								}
+							}
+						}
+
+						err = client.Run(context.Background(), req, &commitResp)
+						if err != nil {
+							log.Fatalf("Failed to execute request: %v", err)
+						}
+
+						if commitResp.Repository.Ref.Target.History.Nodes == nil {
+							break
+						}
+
+						for _, commit := range commitResp.Repository.Ref.Target.History.Nodes {
+							identity := fmt.Sprintf("%s <%s>", commit.Author.Name, commit.Author.Email)
+							if _, exists := unique[identity]; *showall || !exists {
+								unique[identity] = true
+								if *printsource {
+									fmt.Printf("%s - %s\n", identity, commit.CommitURL)
+								} else {
+									fmt.Println(identity)
+								}
+							}
+						}
+
+						if !commitResp.Repository.Ref.Target.History.PageInfo.HasNextPage {
+							break
+						}
+						commitCursor = &commitResp.Repository.Ref.Target.History.PageInfo.EndCursor
+						time.Sleep(500 * time.Millisecond)
+					}
+				}
+
+				if !refResp.Repository.Refs.PageInfo.HasNextPage {
+					break
+				}
+				refCursor = &refResp.Repository.Refs.PageInfo.EndCursor
+				time.Sleep(500 * time.Millisecond)
 			}
 		}
 
+		if !repoResp.User.RepositoriesContributedTo.PageInfo.HasNextPage {
+			break
+		}
+		repoCursor = &repoResp.User.RepositoriesContributedTo.PageInfo.EndCursor
+		time.Sleep(500 * time.Millisecond)
 	}
 }
